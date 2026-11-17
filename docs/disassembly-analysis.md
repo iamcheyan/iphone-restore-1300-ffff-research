@@ -256,3 +256,64 @@ _AMAuthInstallBundleCopyPersonalizediBootEANFirmwareURLs:
 ```
 
 这证明了：只要将 IPSW 内 `BuildManifest.plist` 中对应 BuildIdentity 下各组件的 `Info -> IsiBootEANFirmware` 设为 `false`，`_AMAuthInstallBundleCopyPersonalizediBootEANFirmwareURLs` 返回的字典即为空字典（`count == 0`），从而由 `MobileDevice.framework` 原生触发 `iBootEANNuke = true`。
+
+> **实测补充说明**：
+> 在 `iPhoneUpdater-2.log` 实测中发现，`MobileDevice.framework` 虽然在本地 `restoreOptions` 字典上设置了 `iBootEANNuke = true` 并打印了 `Setting kAMRestoreOptionsiBootEANNuke.`，但在构造通过 USB 发送给手机端 `restored_update` 的 `RestoreOptions` 消息字典时，**遗漏了转发 `iBootEANNuke` 键**。因此手机端仅因 `count == 0` 跳过了 `_write_ean_image` 并完成了 100% 刷机流程（`Restore completed, status: 0`），而没有执行 `0x100057d10` 处的 `Nuking iBootEAN keys.`。
+
+---
+
+## 五、解包 `RestoreKernelCache` (`kernelcache.release.d47`) 与 `AppleNVMeEAN.cpp` 内核驱动分析
+
+为了查明为什么即便将 `ifw2` 写入体积缩减至 **32 KB (`imageSize=32768`)**（见 `iPhoneUpdater-6.log`），`AppleNVMeEAN` 的 `selector = 2` (`writeImage`) 依然返回 `0xe00002e9` (`kIOReturnDeviceError`)，我们进一步解包了 `kernelcache.release.d47`：
+
+### 5.1 解压 IM4P + LZFSE (`bvx2`) 内核缓存
+
+`kernelcache.release.d47` 前 99 字节为 ASN.1 `IM4P` (`krnl`) 头部，从偏移 `99` (`0x63`) 开始是标准的 **LZFSE (`bvx2`)** 压缩流。使用 macOS 系统自带的 `libcompression.dylib` 即可直接解压出 96.4 MB 的 `MH_FILESET` Mach-O 内核镜像：
+
+```python
+import ctypes, zipfile
+
+libcomp = ctypes.CDLL("/usr/lib/libcompression.dylib")
+with zipfile.ZipFile("iPhone17,3_27.2.1_24B156_Restore.ipsw") as z:
+    data = z.read("kernelcache.release.d47")
+
+bvx_off = data.find(b"bvx2")  # offset = 99
+comp_stream = data[bvx_off:]
+dst_size = 160 * 1024 * 1024
+dst_buf = ctypes.create_string_buffer(dst_size)
+decompressed_len = libcomp.compression_decode_buffer(
+    dst_buf, dst_size, comp_stream, len(comp_stream), None, 0x800  # COMPRESSION_LZFSE
+)
+open("/tmp/kc_raw.macho", "wb").write(dst_buf.raw[:decompressed_len])
+```
+
+### 5.2 `AppleNVMeEAN.cpp` 与 `AppleNVMeEANUC.cpp` 内核断言与校验逻辑
+
+在解压后的内核镜像偏移 `0x9e5a0f`–`0x9e67c9` 处，我们定位到内核驱动 `com.apple.driver.AppleNVMe` 的两个核心源文件：
+- `/Library/Caches/com.apple.xbs/Sources/IONVMeFamily/Embedded/AppleNVMeEAN.cpp`
+- `/Library/Caches/com.apple.xbs/Sources/IONVMeFamily/Embedded/AppleNVMeEANUC.cpp`
+
+其中包含以下关键断言与错误字符串：
+
+```c
+// 1. UserClient 入参及可恢复性检查 (AppleNVMeEANUC.cpp)
+assert(arguments->scalarInputCount == 3);
+assert(fProvider->isImageDataRecoverable(key) != UNRECOVERABLE);
+
+// 2. 容量边界检查 (AppleNVMeEAN.cpp)
+assert(fIsFormatted);
+assert((fHeader->totalBytesWritten + (size_t)(inImageSize - fHeader->image[inImageIndex].imageSize)) <= fHeader->totalSize);
+
+// 3. 覆写/擦除已有键值时的镜像完整性校验 (AppleNVMeEAN.cpp)
+// 当覆写已存在的 ifw2 时，驱动会调用 eraseImage() -> verifyImages() 检查现有镜像的 CRC32 并执行 NAND Unmap：
+"nvme: EAN verifyImages() failed during eraseImage()\n"
+"nvme: Image checksum failed. ExpectedCRC = 0x%x @ OldOffset = 0x%x, inImageIndex = %d, ErrorCRC = 0x%x @ NewOffset = 0x%x, key = 0x%x, size=0x%x unmapOffset = 0x%x, unmapSize = 0x%x \n"
+"nvme: EAN Error: failed to query the unmap states of image index = %d\n"
+```
+
+### 5.3 结论：为什么「存储写满 100% 卡死」会导致 `ifw2` 永久无法覆写？
+
+1. 当手机此前因存储空间 100% 写满而卡死断电时，EAN 分区中的暂存槽位 `ifw2`（或 `fHeader` 中的 `totalBytesWritten` / 镜像 CRC）处于半写入或损坏状态，抑或底层 ANS2 闪存控制器的 FTL 因满盘耗尽预留块（OP 区）而将该引导块锁入只读/不可恢复状态（`UNRECOVERABLE`）。
+2. 刷机时，`format_ean_storage` 只检查 `fIsFormatted`（`fHeader->signature` 有效），因此跳过 `selector = 1`（重新格式化整个 EAN 分区头），只执行了 `selector = 9`（清理非 `ifw1`/`ifw2` 的普通图像）。
+3. 随后在 `update_iBoot` 阶段，无论向 `ifw2` 写入 7.81 MB 还是 32 KB，`AppleNVMeEAN::eanWrite` 在尝试覆写已存在的 `ifw2` 条目时，都会触发对现有 `ifw2` 镜像的 `eraseImage()` / `verifyImages()` 校验或底层 ANS2 Unmap/Write 操作，并因旧 `ifw2` 的 CRC 损坏或物理块锁死而立即返回 `0xe00002e9` (`kIOReturnDeviceError`)。
+
