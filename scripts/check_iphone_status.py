@@ -15,6 +15,7 @@ def check_ioreg():
         text=True,
     ).stdout
     modes = {
+        61460: "Port DFU Mode (0xf014 - iPhone 16 USB-C KIS 硬件级 DFU 模式)",
         4647: "DFU Mode (0x1227 - 硬件级固件升级模式)",
         4737: "Recovery Mode (0x1281 - 普通恢复模式 iBoot)",
         4780: "RestoreOS Ramdisk Mode (0x12ac - 刷机内存盘模式)",
